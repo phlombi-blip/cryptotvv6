@@ -1,13 +1,15 @@
-# ui.py
-
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime
-from html import escape  # für sichere Tooltips
+from html import escape  # für sichere Tooltips d
+
+# KI-CoPilot Module
+from ai.copilot import ask_copilot
 
 from charts import create_price_rsi_figure, create_signal_history_figure
+from email_notifier import send_signal_email
 
 # Optional: Auto-Refresh (falls Paket installiert ist)
 try:
@@ -19,7 +21,7 @@ except ImportError:
 # BASIS-KONFIGURATION
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Crypto Live Ticker – TradingView Style V5",
+    page_title="Crypto Live + AI CoPilot",
     layout="wide",
 )
 
@@ -78,8 +80,8 @@ body, .main {
     background-color: #020617;
 }
 .block-container {
-    padding-top: 1rem;
-    padding-bottom: 1rem;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
 }
 .tv-card {
     background: #020617;
@@ -109,8 +111,8 @@ body, .main {
     background-color: #F3F4F6;
 }
 .block-container {
-    padding-top: 1rem;
-    padding-bottom: 1rem;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
 }
 .tv-card {
     background: #FFFFFF;
@@ -224,7 +226,6 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     EMA20/EMA50, MA200, Bollinger 20, RSI14.
-    MA200 = klassischer Bitcoin-Makrotrendfilter.
     """
     if df.empty:
         return df
@@ -289,15 +290,13 @@ def _signal_core_with_reason(last, prev):
     if close < ma200:
         return "HOLD", "Kurs liegt unter MA200 – System handelt nur Long im Bullenmarkt."
 
-    # -------------------------------------------------------
-    # Blow-Off-Top Detector (Bitcoin-spezifisch)
-    # -------------------------------------------------------
+    # Blow-Off-Top Detector
     blowoff = (
         candle_range > 0
-        and upper_wick > candle_range * 0.45  # langer oberer Docht
-        and close < prev_close                # Umkehrkerze
-        and close > bb_up                     # über dem oberen BB
-        and rsi_now > 73                      # RSI hoch
+        and upper_wick > candle_range * 0.45
+        and close < prev_close
+        and close > bb_up
+        and rsi_now > 73
     )
 
     if blowoff:
@@ -307,9 +306,7 @@ def _signal_core_with_reason(last, prev):
             "und RSI > 73 mit Umkehrkerze – hohes Top-Risiko."
         )
 
-    # -------------------------------------------------------
-    # Adaptive STRONG BUY – tiefer Dip
-    # -------------------------------------------------------
+    # STRONG BUY – tiefer Dip
     deep_dip = (
         close <= bb_lo
         and rsi_now < 35
@@ -329,9 +326,7 @@ def _signal_core_with_reason(last, prev):
             "kräftiges Long-Signal."
         )
 
-    # -------------------------------------------------------
     # BUY – normale gesunde Pullbacks
-    # -------------------------------------------------------
     buy_price_cond = (
         close <= bb_lo * (1.01 if is_high_vol else 1.00)
         or close <= ema50 * 0.96
@@ -349,9 +344,7 @@ def _signal_core_with_reason(last, prev):
             "RSI zwischen 30 und 48 und dreht nach oben."
         )
 
-    # -------------------------------------------------------
     # STRONG SELL – extreme Überhitzung
-    # -------------------------------------------------------
     strong_sell_cond = (
         close > ema50 * 1.12
         and close > bb_up
@@ -366,9 +359,7 @@ def _signal_core_with_reason(last, prev):
             "RSI > 80 und fällt bereits – starkes Abverkaufsrisiko."
         )
 
-    # -------------------------------------------------------
     # SELL – normale Übertreibung
-    # -------------------------------------------------------
     sell_cond = (
         close > bb_up
         and rsi_now > 72
@@ -537,6 +528,10 @@ def init_state():
     st.session_state.setdefault("theme", "Dark")
     st.session_state.setdefault("backtest_horizon", 5)
     st.session_state.setdefault("backtest_trades", pd.DataFrame())
+    st.session_state.setdefault("copilot_question", "")
+    # Zeitraum-Defaults (nur Platzhalter, Widget steuert diese Keys)
+    st.session_state.setdefault("date_from", None)
+    st.session_state.setdefault("date_to", None)
 
 
 # ---------------------------------------------------------
@@ -549,32 +544,81 @@ def main():
     if st_autorefresh is not None:
         st_autorefresh(interval=60 * 1000, key="refresh")
 
-    # Sidebar: Theme Toggle
-    st.sidebar.title("⚙️ Einstellungen")
+    # -----------------------------------------------------
+    # SIDEBAR / NAVIGATION – Reihenfolge: Markt, Zeitraum, Backtest, Theme
+    # -----------------------------------------------------
+    st.sidebar.title("⚙️ Navigation & Einstellungen")
+
+    # 1) Markt
+    st.sidebar.markdown("### Markt")
+    symbol_label = st.sidebar.selectbox(
+        "Aktives Symbol",
+        list(SYMBOLS.keys()),
+        index=list(SYMBOLS.keys()).index(st.session_state.selected_symbol),
+    )
+    st.session_state.selected_symbol = symbol_label
+
+    tf_label = st.sidebar.radio(
+        "Timeframe",
+        list(TIMEFRAMES.keys()),
+        index=list(TIMEFRAMES.keys()).index(st.session_state.selected_timeframe),
+    )
+    st.session_state.selected_timeframe = tf_label
+
+    # 2) Zeitraum – Widget steuert date_from/date_to in Session State
+    st.sidebar.markdown("### Zeitraum")
+    today = datetime.utcnow().date()
+    default_from = st.session_state.get("date_from") or today
+    default_to = st.session_state.get("date_to") or today
+
+    st.sidebar.date_input(
+        "📅 Von (Datum)",
+        value=default_from,
+        key="date_from",
+    )
+    st.sidebar.date_input(
+        "📅 Bis (Datum)",
+        value=default_to,
+        key="date_to",
+    )
+
+    # 3) Backtest
+    st.sidebar.markdown("### Backtest")
+    horizon = st.sidebar.slider(
+        "Halte-Dauer (Kerzen)",
+        1,
+        20,
+        value=st.session_state.backtest_horizon,
+    )
+    st.session_state.backtest_horizon = horizon
+
+    # 4) Theme
+    st.sidebar.markdown("### Theme")
     theme = st.sidebar.radio(
-        "Theme",
+        "Darstellung",
         ["Dark", "Light"],
         index=0 if st.session_state.theme == "Dark" else 1,
     )
     st.session_state.theme = theme
 
+    # Theme anwenden
     st.markdown(DARK_CSS if theme == "Dark" else LIGHT_CSS, unsafe_allow_html=True)
 
     # Header Bar
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     st.markdown(
         f"""
-        <div class="tv-card" style="margin-bottom: 0.6rem;">
+        <div class="tv-card" style="margin-bottom: 0.4rem;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <div>
-                    <div class="tv-title">Crypto Live Ticker</div>
-                    <div style="font-size:1.1rem; font-weight:600;">
-                        TradingView Style • Desktop V5
+                    <div class="tv-title">Crypto Live + AI CoPilot</div>
+                    <div style="font-size:1.05rem; font-weight:600;">
+                        TradingView Style • Desktop • KI-Unterstützung
                     </div>
                 </div>
-                <div style="text-align:right; font-size:0.85rem; opacity:0.8;">
+                <div style="text-align:right; font-size:0.8rem; opacity:0.8;">
                     Datenquelle: Bitfinex Spot<br/>
-                    Letztes Update: {now}
+                    Update: {now}
                 </div>
             </div>
         </div>
@@ -582,28 +626,24 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Layout: Watchlist links, Charts rechts
-    col_left, col_right = st.columns([2, 5], gap="medium")
+    # Gemeinsame Basis-Variablen
+    symbol = SYMBOLS[symbol_label]
+    interval_internal = TIMEFRAMES[tf_label]
+
+    # Layout: Links Markt / Charts, Rechts KI-Copilot
+    col_left, col_right = st.columns([4, 1], gap="medium")
 
     # ---------------------------------------------------------
-    # WATCHLIST (LEFT PANEL)
+    # WATCHLIST + CHARTS (LINKS)
     # ---------------------------------------------------------
     with col_left:
+        # WATCHLIST
         with st.container():
             st.markdown('<div class="tv-card">', unsafe_allow_html=True)
             st.markdown('<div class="tv-title">Watchlist</div>', unsafe_allow_html=True)
 
-            sel = st.radio(
-                "Symbol",
-                list(SYMBOLS.keys()),
-                index=list(SYMBOLS.keys()).index(st.session_state.selected_symbol),
-                label_visibility="collapsed",
-            )
-            st.session_state.selected_symbol = sel
-
             rows = []
-            selected_tf_label = st.session_state.selected_timeframe
-            selected_tf_internal = TIMEFRAMES[selected_tf_label]
+            selected_tf_internal = interval_internal
             limit_watch = candles_for_history(selected_tf_internal, years=YEARS_HISTORY)
 
             for label, sym in SYMBOLS.items():
@@ -649,49 +689,22 @@ def main():
                 {"Price": "{:,.2f}", "Change %": "{:+.2f}"}
             )
 
-            st.dataframe(styled, use_container_width=True, height=270)
+            st.dataframe(styled, use_container_width=True, height=220)
 
             st.markdown("</div>", unsafe_allow_html=True)
 
+        # CHART-BEREICH
         st.markdown("")
         with st.container():
             st.markdown('<div class="tv-card">', unsafe_allow_html=True)
-            st.markdown('<div class="tv-title">System</div>', unsafe_allow_html=True)
-            st.write("🖥️ Modus: Desktop TradingView-Style V5")
-            st.write("📡 Feed: Bitfinex Spot (REST API, Public)")
-            st.write("📏 Panels: Price+Volume, RSI, Signals, Backtest, Trades")
-            st.write("🎨 Theme: Dark / Light (Sidebar)")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    # ---------------------------------------------------------
-    # MAIN CHART AREA (RIGHT PANEL)
-    # ---------------------------------------------------------
-    with col_right:
-        with st.container():
-            st.markdown('<div class="tv-card">', unsafe_allow_html=True)
-
-            symbol_label = st.session_state.selected_symbol
-            symbol = SYMBOLS[symbol_label]
-            tf_label = st.session_state.selected_timeframe
-            interval_internal = TIMEFRAMES[tf_label]
 
             st.markdown('<div class="tv-title">Chart</div>', unsafe_allow_html=True)
 
-            # Timeframe-Buttons (horizontal, wie deine alte Version)
-            cols_tf = st.columns(len(TIMEFRAMES))
-            for i, tf in enumerate(TIMEFRAMES.keys()):
-                with cols_tf[i]:
-                    if st.button(tf, key=f"tf_{tf}"):
-                        st.session_state.selected_timeframe = tf
-                        st.rerun()
-
-            # -------------------------------------------------
-            # Daten abrufen + Date-Picker (Von / Bis)
-            # -------------------------------------------------
+            # Daten abrufen + Zeitraum auf Basis der Sidebar-Werte
             try:
                 limit_main = candles_for_history(interval_internal, years=YEARS_HISTORY)
 
-                # 1) komplette Historie laden
+                # komplette Historie laden
                 df_all = cached_fetch_klines(symbol, interval_internal, limit=limit_main)
 
                 date_from = None
@@ -699,51 +712,34 @@ def main():
                 mask = None
 
                 if not df_all.empty:
-                    # Min/Max Datum aus voller Historie
                     min_date = df_all.index.min().date()
                     max_date = df_all.index.max().date()
 
-                    # Defaults aus Session State (oder volle Range)
-                    default_from = st.session_state.get("date_from", min_date)
-                    default_to = st.session_state.get("date_to", max_date)
+                    # Sidebar-Werte holen (können auch außerhalb des Bereichs liegen)
+                    date_from = st.session_state.get("date_from") or min_date
+                    date_to = st.session_state.get("date_to") or max_date
 
-                    # clampen, falls sich der verfügbare Bereich geändert hat
-                    if default_from < min_date or default_from > max_date:
-                        default_from = min_date
-                    if default_to < min_date or default_to > max_date:
-                        default_to = max_date
+                    # Falls out-of-range, einfach lokal clampen – Session State NICHT überschreiben
+                    if date_from < min_date:
+                        date_from = min_date
+                    if date_from > max_date:
+                        date_from = max_date
 
-                    c_from, c_to = st.columns(2)
-                    with c_from:
-                        date_from = st.date_input(
-                            "📅 Von (Datum)",
-                            value=default_from,
-                            min_value=min_date,
-                            max_value=max_date,
-                            key="date_from",
-                        )
-                    with c_to:
-                        date_to = st.date_input(
-                            "📅 Bis (Datum)",
-                            value=default_to,
-                            min_value=min_date,
-                            max_value=max_date,
-                            key="date_to",
-                        )
+                    if date_to < min_date:
+                        date_to = min_date
+                    if date_to > max_date:
+                        date_to = max_date
 
-                    # falls vertauscht → korrigieren
                     if date_from > date_to:
                         date_from, date_to = date_to, date_from
 
-                    # Maske für sichtbaren Zeitraum
                     mask = (df_all.index.date >= date_from) & (df_all.index.date <= date_to)
 
-                # 2) Indikatoren & Signale auf kompletter Historie berechnen
+                # Indikatoren & Signale auf kompletter Historie
                 if not df_all.empty:
                     df_all_ind = compute_indicators(df_all.copy())
                     df_all_ind = compute_signals(df_all_ind)
 
-                    # 3) Sichtbaren Zeitraum ausschneiden
                     if mask is not None:
                         df = df_all_ind.loc[mask]
                     else:
@@ -751,7 +747,7 @@ def main():
                 else:
                     df = pd.DataFrame()
 
-                # 4) Kennzahlen / Stati setzen
+                # Kennzahlen / Stati
                 if df.empty:
                     sig = "NO DATA"
                     last_price = 0
@@ -773,6 +769,31 @@ def main():
                     signal_reason = last.get("signal_reason", "")
                     feed_ok = True
                     error_msg = ""
+
+                    # E-Mail Push bei Signalwechsel (Gmail)
+                    prev_key = f"last_signal_{symbol_label}_{tf_label}"
+                    prev_sig = st.session_state.get(prev_key)
+
+                    if prev_sig != sig and sig in ["STRONG BUY", "BUY", "SELL", "STRONG SELL"]:
+                        ok_email, msg_email = send_signal_email(
+                            previous_signal=prev_sig,
+                            new_signal=sig,
+                            symbol=symbol_label,
+                            timeframe=tf_label,
+                            price=last_price,
+                            reason=signal_reason,
+                            when=last_time,
+                        )
+                        if ok_email:
+                            st.toast(f"📧 Signalwechsel: {prev_sig or 'NONE'} → {sig} – E-Mail gesendet.")
+                        else:
+                            # Nur Info im UI, keine Exception
+                            st.info(
+                                f"Signalwechsel erkannt ({prev_sig or 'NONE'} → {sig}), "
+                                f"aber E-Mail konnte nicht gesendet werden: {msg_email}"
+                            )
+
+                    st.session_state[prev_key] = sig
 
             except Exception as e:
                 df = pd.DataFrame()
@@ -831,9 +852,7 @@ def main():
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---------------------------------------------------------
-        # SIGNAL-HISTORY + BACKTEST PANELS
-        # ---------------------------------------------------------
+        # Signal-History + Backtest
         st.markdown("")
         col_hist, col_bt = st.columns([3, 2])
 
@@ -867,13 +886,8 @@ def main():
                 if df.empty:
                     st.info("Keine Daten.")
                 else:
-                    horizon = st.slider(
-                        "Halte-Dauer (Kerzen)",
-                        1,
-                        20,
-                        value=st.session_state.backtest_horizon,
-                    )
-                    st.session_state.backtest_horizon = horizon
+                    horizon = st.session_state.backtest_horizon
+                    st.caption(f"Halte-Dauer: **{horizon} Kerzen**")
 
                     bt = compute_backtest_trades(df, horizon)
                     st.session_state.backtest_trades = bt
@@ -894,9 +908,7 @@ def main():
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---------------------------------------------------------
         # TRADES LIST – MIT CSV EXPORT
-        # ---------------------------------------------------------
         st.markdown("")
         with st.container():
             st.markdown('<div class="tv-card">', unsafe_allow_html=True)
@@ -925,7 +937,7 @@ def main():
                 ]
                 df_show = df_show[[c for c in cols if c in df_show.columns]]
 
-                st.dataframe(df_show, use_container_width=True, height=260)
+                st.dataframe(df_show, use_container_width=True, height=220)
 
                 csv = bt.to_csv(index=False).encode("utf-8")
                 st.download_button(
@@ -937,12 +949,99 @@ def main():
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Refresh Button
-        st.markdown("")
-        r1, r2 = st.columns([1, 5])
-        with r1:
-            if st.button("🔄 Refresh"):
-                st.rerun()
+    # ---------------------------------------------------------
+    # RECHTS: KI-COPILOT (Auto-Analyse = CoPilot)
+    # ---------------------------------------------------------
+    with col_right:
+        with st.container():
+            st.markdown('<div class="tv-card">', unsafe_allow_html=True)
+            st.markdown('<div class="tv-title">🤖 KI-CoPilot</div>', unsafe_allow_html=True)
 
-        with r2:
-            st.caption("Charts aktualisieren automatisch alle 60 Sekunden (oder manuell per Button).")
+            if df.empty:
+                st.info("Keine Marktdaten geladen – bitte zuerst einen gültigen Zeitraum wählen.")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+
+            # Key für Auto-Analyse im Session-State (pro Symbol + Timeframe)
+            auto_key = f"copilot_auto_{symbol_label}_{tf_label}"
+
+            def run_auto_analysis():
+                """Startet eine automatische CoPilot-Analyse und speichert das Ergebnis im Session State."""
+                with st.spinner("CoPilot analysiert den Chart..."):
+                    st.session_state[auto_key] = ask_copilot(
+                        question=(
+                            "Bitte analysiere den aktuellen Chart anhand von RSI(14), EMA20, EMA50, MA200, "
+                            "Bollinger-Bändern und der Candlestick-Struktur (Trend, Pullbacks, Übertreibungen). "
+                            "Beschreibe zuerst nüchtern die technische Lage. "
+                            "Formuliere danach eine mögliche technische Handelsidee basierend auf der "
+                            "Marktpsychologie (z.B. FOMO, Panik, Kapitulation, Rebound), mit grober Einstiegszone, "
+                            "Stop-Zone und Zielzone – ohne Beträge, Hebel oder Positionsgrößen. "
+                            "Weise am Ende klar darauf hin, dass dies keine Anlageberatung ist, sondern nur ein "
+                            "hypothetisches Szenario."
+                        ),
+                        df=df,
+                        symbol=symbol_label,
+                        timeframe=tf_label,
+                        last_signal=sig,
+                    )
+
+            # Beim ersten Aufruf für dieses Symbol/TF automatisch Analyse holen
+            if auto_key not in st.session_state:
+                run_auto_analysis()
+
+            auto_text = st.session_state.get(auto_key, "Noch keine Analyse verfügbar.")
+
+            # Tabs: links Auto-Analyse (CoPilot), rechts Chat
+            tab_auto, tab_chat = st.tabs(["📊 Auto-Analyse (CoPilot)", "💬 KI-Chat"])
+
+            # --- TAB 1: Auto-Analyse / Insights (nur CoPilot) ---
+            with tab_auto:
+                st.markdown(f"**Automatische KI-Analyse ({symbol_label} – {tf_label})**")
+            
+                if st.button(
+                    "🔄 Analyse aktualisieren",
+                    key=f"btn_reanalyse_{symbol_label}_{tf_label}",
+                ):
+                    run_auto_analysis()
+            
+                auto_text = st.session_state.get(auto_key, "Noch keine Analyse verfügbar.")
+                st.write(auto_text)
+
+            # --- TAB 2: Interaktiver KI-Chat ---
+            with tab_chat:
+                st.markdown("**Frag den CoPilot** – z.B.:")
+                st.caption("„Wie würdest du den aktuellen BTC-Chart interpretieren?“")
+                st.caption("„Welche Risiken siehst du im aktuellen Setup?“")
+
+                question = st.text_area(
+                    "Deine Frage an den KI-CoPilot",
+                    value=st.session_state.get("copilot_question", ""),
+                    height=80,
+                )
+                st.session_state.copilot_question = question
+
+                if st.button(
+                    "Antwort vom CoPilot holen",
+                    key=f"btn_copilot_chat_{symbol_label}_{tf_label}",
+                ):
+                    if not question.strip():
+                        st.warning("Bitte zuerst eine Frage eingeben.")
+                    else:
+                        with st.spinner("CoPilot denkt nach..."):
+                            answer = ask_copilot(
+                                question=question,
+                                df=df,
+                                symbol=symbol_label,
+                                timeframe=tf_label,
+                                last_signal=sig,
+                            )
+                        st.markdown("**Antwort:**")
+                        st.write(answer)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# LAUNCH
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    main()
